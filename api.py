@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import fdb
-import os
-from dotenv import load_dotenv
+import socket
+import time
 from typing import Union
+import logging
 
-load_dotenv()
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -21,18 +24,31 @@ class LogAlteracao(BaseModel):
     tabela: str
     operacao: str
     dados: dict
-    id_registro: Union[int, str]  # aceita int ou str
+    id_registro: Union[int, str]
     data_alteracao: str
+
+def testar_conexao_firebird(host, port, timeout=10):
+    """Testa conectividade básica com o servidor Firebird"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        logger.error(f"Falha na conexão com {host}:{port} - {str(e)}")
+        return False
 
 @app.post("/replicar")
 def replicar_log(log: LogAlteracao):
-    # Carrega as variáveis de conexão
-    dsn_remoto = os.getenv("FIREBIRD_DSN")
-    user_remoto = os.getenv("FIREBIRD_USER")
-    pass_remoto = os.getenv("FIREBIRD_PASS")
+    host = "db-junior-repl-3.sp1.br.saveincloud.net.br"
+    port = 16475
+    database = "/opt/firebird/data/dados-junior-remoto.fdb"
+    user_remoto = "SYSDBA"
+    pass_remoto = "zyAhhI2tUSdIaG9d0Pa0"
 
-    if not all([dsn_remoto, user_remoto, pass_remoto]):
-        raise HTTPException(status_code=500, detail="Dados de conexão ausentes ou inválidos")
+    # Teste básico de conectividade
+    if not testar_conexao_firebird(host, port):
+        error_msg = f"Não foi possível conectar ao servidor Firebird em {host}:{port}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
     tabela = log.tabela.upper()
     if tabela not in chave_primaria_por_tabela:
@@ -41,18 +57,32 @@ def replicar_log(log: LogAlteracao):
     campo_id = chave_primaria_por_tabela[tabela]
 
     try:
-        # Conecta ao banco remoto
-        conn = fdb.connect(dsn=dsn_remoto, user=user_remoto, password=pass_remoto)
+        logger.info(f"Tentando conectar ao Firebird: {host}:{port}{database}")
+        
+        # Conecta ao banco remoto com parâmetros separados
+        conn = fdb.connect(
+            host=host,
+            port=port,
+            database=database,
+            user=user_remoto,
+            password=pass_remoto,
+        )
+            
         cur = conn.cursor()
+        logger.info(f"Conexão estabelecida com sucesso! Versão: {conn.firebird_version}")
 
         dados_dict = log.dados
-        print(f"[LOG] Operação: {log.operacao} | Tabela: {tabela} | Dados: {dados_dict} | ID_REGISTRO: {log.id_registro}")
+        logger.info(f"Operação: {log.operacao} | Tabela: {tabela} | ID_REGISTRO: {log.id_registro}")
 
         # INSERT
         if log.operacao.upper() == 'INSERT':
             campos = ', '.join(dados_dict.keys())
             placeholders = ', '.join(['?'] * len(dados_dict))
             sql = f"INSERT INTO {tabela} ({campos}) VALUES ({placeholders})"
+            
+            logger.debug(f"SQL: {sql}")
+            logger.debug(f"Valores: {tuple(dados_dict.values())}")
+            
             cur.execute(sql, tuple(dados_dict.values()))
             conn.commit()
             return {"status": "success", "msg": f"Insert na tabela {tabela}"}
@@ -65,6 +95,10 @@ def replicar_log(log: LogAlteracao):
             set_clause = ', '.join([f"{k} = ?" for k in dados_dict])
             sql = f"UPDATE {tabela} SET {set_clause} WHERE {campo_id} = ?"
             valores = list(dados_dict.values()) + [log.id_registro]
+            
+            logger.debug(f"SQL: {sql}")
+            logger.debug(f"Valores: {tuple(valores)}")
+            
             cur.execute(sql, tuple(valores))
             conn.commit()
             return {"status": "success", "msg": f"Update na tabela {tabela}"}
@@ -75,6 +109,10 @@ def replicar_log(log: LogAlteracao):
                 raise HTTPException(status_code=400, detail="Campo 'id_registro' é obrigatório para DELETE")
 
             sql = f"DELETE FROM {tabela} WHERE {campo_id} = ?"
+            
+            logger.debug(f"SQL: {sql}")
+            logger.debug(f"Valor: {log.id_registro}")
+            
             cur.execute(sql, (log.id_registro,))
             conn.commit()
             return {"status": "success", "msg": f"Delete na tabela {tabela}"}
@@ -82,9 +120,15 @@ def replicar_log(log: LogAlteracao):
         else:
             raise HTTPException(status_code=400, detail="Operação não suportada")
 
+    except fdb.fbcore.DatabaseError as e:
+        error_msg = f"Erro de banco de dados: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    
     except Exception as e:
-        print(f"[ERRO] {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Erro inesperado: {str(e)}"
+        logger.exception(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
     finally:
         if 'cur' in locals():
