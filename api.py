@@ -1,10 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import fdb
 import socket
-import time
 from typing import Union
 import logging
+import json
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +28,6 @@ class LogAlteracao(BaseModel):
     data_alteracao: str
 
 def testar_conexao_firebird(host, port, timeout=10):
-    """Testa conectividade básica com o servidor Firebird"""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -36,102 +35,98 @@ def testar_conexao_firebird(host, port, timeout=10):
         logger.error(f"Falha na conexão com {host}:{port} - {str(e)}")
         return False
 
-@app.post("/replicar")
-def replicar_log(log: LogAlteracao):
-    host = "db-junior-repl-3.sp1.br.saveincloud.net.br"
-    port = 16475
-    database = "/opt/firebird/data/dados-junior-remoto.fdb"
-    user_remoto = "SYSDBA"
-    pass_remoto = "zyAhhI2tUSdIaG9d0Pa0"
-
-    # Teste básico de conectividade
-    if not testar_conexao_firebird(host, port):
-        error_msg = f"Não foi possível conectar ao servidor Firebird em {host}:{port}"
-        logger.error(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-
-    tabela = log.tabela.upper()
-    if tabela not in chave_primaria_por_tabela:
-        raise HTTPException(status_code=400, detail=f"Tabela inválida: {tabela}")
-
-    campo_id = chave_primaria_por_tabela[tabela]
-
+@app.websocket("/ws/replicar")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
     try:
-        logger.info(f"Tentando conectar ao Firebird: {host}:{port}{database}")
-        
-        # Conecta ao banco remoto com parâmetros separados
-        conn = fdb.connect(
-            host=host,
-            port=port,
-            database=database,
-            user=user_remoto,
-            password=pass_remoto,
-        )
-            
-        cur = conn.cursor()
-        logger.info(f"Conexão estabelecida com sucesso! Versão: {conn.firebird_version}")
+        while True:
+            msg = await websocket.receive_text()
+            try:
+                log_dict = json.loads(msg)
+                log = LogAlteracao(**log_dict)
+            except Exception as e:
+                await websocket.send_json({"status": "error", "detail": f"JSON inválido: {str(e)}"})
+                continue
 
-        dados_dict = log.dados
-        logger.info(f"Operação: {log.operacao} | Tabela: {tabela} | ID_REGISTRO: {log.id_registro}")
+            host = "db-junior-repl-3.sp1.br.saveincloud.net.br"
+            port = 16475
+            database = "/opt/firebird/data/dados-junior-remoto.fdb"
+            user_remoto = "SYSDBA"
+            pass_remoto = "zyAhhI2tUSdIaG9d0Pa0"
 
-        # INSERT
-        if log.operacao.upper() == 'INSERT':
-            campos = ', '.join(dados_dict.keys())
-            placeholders = ', '.join(['?'] * len(dados_dict))
-            sql = f"INSERT INTO {tabela} ({campos}) VALUES ({placeholders})"
-            
-            logger.debug(f"SQL: {sql}")
-            logger.debug(f"Valores: {tuple(dados_dict.values())}")
-            
-            cur.execute(sql, tuple(dados_dict.values()))
-            conn.commit()
-            return {"status": "success", "msg": f"Insert na tabela {tabela}"}
+            if not testar_conexao_firebird(host, port):
+                await websocket.send_json({"status": "error", "detail": f"Não foi possível conectar ao servidor Firebird em {host}:{port}"})
+                continue
 
-        # UPDATE
-        elif log.operacao.upper() == 'UPDATE':
-            if not log.id_registro:
-                raise HTTPException(status_code=400, detail="Campo 'id_registro' é obrigatório para UPDATE")
+            tabela = log.tabela.upper()
+            if tabela not in chave_primaria_por_tabela:
+                await websocket.send_json({"status": "error", "detail": f"Tabela inválida: {tabela}"})
+                continue
 
-            set_clause = ', '.join([f"{k} = ?" for k in dados_dict])
-            sql = f"UPDATE {tabela} SET {set_clause} WHERE {campo_id} = ?"
-            valores = list(dados_dict.values()) + [log.id_registro]
-            
-            logger.debug(f"SQL: {sql}")
-            logger.debug(f"Valores: {tuple(valores)}")
-            
-            cur.execute(sql, tuple(valores))
-            conn.commit()
-            return {"status": "success", "msg": f"Update na tabela {tabela}"}
+            campo_id = chave_primaria_por_tabela[tabela]
 
-        # DELETE
-        elif log.operacao.upper() == 'DELETE':
-            if not log.id_registro:
-                raise HTTPException(status_code=400, detail="Campo 'id_registro' é obrigatório para DELETE")
+            try:
+                conn = fdb.connect(
+                    host=host,
+                    port=port,
+                    database=database,
+                    user=user_remoto,
+                    password=pass_remoto,
+                )
+                cur = conn.cursor()
 
-            sql = f"DELETE FROM {tabela} WHERE {campo_id} = ?"
-            
-            logger.debug(f"SQL: {sql}")
-            logger.debug(f"Valor: {log.id_registro}")
-            
-            cur.execute(sql, (log.id_registro,))
-            conn.commit()
-            return {"status": "success", "msg": f"Delete na tabela {tabela}"}
+                dados_dict = log.dados
+                operacao = log.operacao.upper()
 
-        else:
-            raise HTTPException(status_code=400, detail="Operação não suportada")
+                if operacao == 'INSERT':
+                    campos = ', '.join(dados_dict.keys())
+                    placeholders = ', '.join(['?'] * len(dados_dict))
+                    sql = f"INSERT INTO {tabela} ({campos}) VALUES ({placeholders})"
+                    cur.execute(sql, tuple(dados_dict.values()))
 
-    except fdb.fbcore.DatabaseError as e:
-        error_msg = f"Erro de banco de dados: {str(e)}"
-        logger.error(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-    
-    except Exception as e:
-        error_msg = f"Erro inesperado: {str(e)}"
-        logger.exception(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
+                elif operacao == 'UPDATE':
+                    if not log.id_registro:
+                        await websocket.send_json({"status": "error", "detail": "Campo 'id_registro' obrigatório para UPDATE"})
+                        continue
+                    set_clause = ', '.join([f"{k} = ?" for k in dados_dict])
+                    sql = f"UPDATE {tabela} SET {set_clause} WHERE {campo_id} = ?"
+                    valores = list(dados_dict.values()) + [log.id_registro]
+                    cur.execute(sql, tuple(valores))
 
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if 'conn' in locals():
-            conn.close()
+                elif operacao == 'DELETE':
+                    if not log.id_registro:
+                        await websocket.send_json({"status": "error", "detail": "Campo 'id_registro' obrigatório para DELETE"})
+                        continue
+                    sql = f"DELETE FROM {tabela} WHERE {campo_id} = ?"
+                    cur.execute(sql, (log.id_registro,))
+
+                else:
+                    await websocket.send_json({"status": "error", "detail": "Operação não suportada"})
+                    continue
+
+                conn.commit()
+
+                # Excluir o log correspondente da tabela LOG_ALTERACOES
+                try:
+                    sql_delete_log = "DELETE FROM LOG_ALTERACOES WHERE ID_LOG = ?"
+                    cur.execute(sql_delete_log, (log.id_log,))
+                    conn.commit()
+                except Exception as e:
+                    await websocket.send_json({"status": "warning", "detail": f"Operação replicada, mas falha ao excluir da LOG_ALTERACOES: {str(e)}"})
+
+                await websocket.send_json({"status": "success", "msg": f"{operacao} na tabela {tabela}"})
+
+            except fdb.fbcore.DatabaseError as e:
+                await websocket.send_json({"status": "error", "detail": f"Erro de banco de dados: {str(e)}"})
+
+            except Exception as e:
+                await websocket.send_json({"status": "error", "detail": f"Erro inesperado: {str(e)}"})
+
+            finally:
+                if 'cur' in locals():
+                    cur.close()
+                if 'conn' in locals():
+                    conn.close()
+
+    except WebSocketDisconnect:
+        logger.info("Cliente desconectado do WebSocket")
