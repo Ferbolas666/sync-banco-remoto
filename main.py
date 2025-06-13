@@ -13,7 +13,8 @@ app = FastAPI()
 async def replicar_dados(request: Request):
     dados = await request.json()
     print("📥 Dados recebidos:", dados)
-    return {"status": "ok"}
+    return {"status": "ok"}  # <- Altere isso para {"status": "success"} no local que realmente confirma a replicação
+
 
 def ler_connection_txt(caminho_txt):
     config = {}
@@ -121,17 +122,29 @@ def monitorar_logs_remoto(host, port, database, user, password, api_url, interva
                         headers=headers,
                         timeout=30
                     )
+
                     if response.status_code == 200:
-                        print(f"✅ Dados enviados com sucesso! Response: {response.text}")
+                        resposta_json = response.json()
+                        if resposta_json.get("status") == "success":
+                            print(f"✅ Dados replicados com sucesso! Removendo LOG_ALTERACOES ID = {id_log}")
+
+                            cur.execute("""
+                                DELETE FROM LOG_ALTERACOES
+                                WHERE ID = ?
+                            """, (id_log,))
+                            conn.commit()
+                            print(f"🧹 Log ID {id_log} removido com sucesso.")
+                            last_id_log = id_log
+                        else:
+                            print(f"⚠️ API respondeu mas não confirmou sucesso: {resposta_json}")
                     else:
                         print(f"⚠️ Resposta inesperada da API: {response.status_code} - {response.text}")
-                    response.raise_for_status()
+                        response.raise_for_status()
+
                 except RequestException as e:
                     print(f"❌ Erro ao enviar dados para a API: {str(e)}")
                     if hasattr(e, 'response') and e.response:
                         print(f"Detalhes do erro: {e.response.text}")
-
-                last_id_log = id_log
 
             cur.close()
             conn.close()
